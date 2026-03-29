@@ -90,7 +90,7 @@ const WF = {
 const TRANSITIONS = {
   lead_created:['scan_started'], scan_started:['scan_completed','lead_created'],
   scan_completed:['proposal_generated'], proposal_generated:['proposal_presented','proposal_accepted','finance_started'],
-  proposal_presented:['proposal_accepted'], proposal_accepted:['finance_started','contract_ready'],
+  proposal_presented:['proposal_accepted','contract_ready'], proposal_accepted:['finance_started','contract_ready'],
   finance_started:['finance_completed','proposal_accepted'], finance_completed:['contract_ready'],
   contract_ready:['contract_signed'], contract_signed:['schedule_requested'],
   schedule_requested:['schedule_pending'], schedule_pending:['schedule_confirmed','schedule_requested'],
@@ -243,7 +243,7 @@ app.post('/contract/sign', rateLimit(5,900000), requireAuth, async (req,res) => 
   if (!artifactId||!documentHash||!signatureHash) return res.status(400).json({ error:'artifactId, documentHash, signatureHash required' });
   const wf = await getWFState(req.uid);
   const cs = wf?.currentState;
-  if (firebaseReady&&cs&&!['finance_completed','proposal_accepted','contract_ready','contract_signed'].includes(cs)) return res.status(409).json({ error:`Cannot sign from state: ${cs}` });
+  if (firebaseReady&&cs&&!['proposal_generated','proposal_presented','proposal_accepted','finance_completed','contract_ready','contract_signed'].includes(cs)) return res.status(409).json({ error:`Cannot sign from state: ${cs}` });
   if (db) {
     try { await db.collection('contracts').doc(san(artifactId)).set({ artifactId:san(artifactId), clientId:req.uid, clientEmail:req.email, documentHash:san(documentHash), signatureHash:san(signatureHash), signedAt:san(signedAt||new Date().toISOString()), contractSummary:sanObj(contractSummary||{}), deviceMeta:sanObj(deviceMeta||{}), contractVersion:'2026.1', serverVerified:true, createdAt:admin.firestore.FieldValue.serverTimestamp() }); }
     catch(e) { return res.status(500).json({ error:'Could not save contract' }); }
