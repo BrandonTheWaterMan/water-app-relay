@@ -89,7 +89,7 @@ const WF = {
 };
 const TRANSITIONS = {
   lead_created:['scan_started'], scan_started:['scan_completed','lead_created'],
-  scan_completed:['proposal_generated'], proposal_generated:['proposal_presented'],
+  scan_completed:['proposal_generated'], proposal_generated:['proposal_presented','proposal_accepted','finance_started'],
   proposal_presented:['proposal_accepted'], proposal_accepted:['finance_started','contract_ready'],
   finance_started:['finance_completed','proposal_accepted'], finance_completed:['contract_ready'],
   contract_ready:['contract_signed'], contract_signed:['schedule_requested'],
@@ -141,7 +141,15 @@ function buildProv(ewg, epa, fetchStart, zip) {
 }
 
 // ── Email helper ────────────────────────────────────────
-function getTransporter() { return nodemailer.createTransport({ service:'gmail', auth:{ user:process.env.GMAIL_USER, pass:process.env.GMAIL_PASS } }); }
+function getTransporter() {
+  return nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false, // STARTTLS — Render free tier allows 587, blocks 465
+    auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASS },
+    tls: { rejectUnauthorized: false }
+  });
+}
 async function mail(to, subj, html, replyTo) { await getTransporter().sendMail({ from:`"The Water App" <${process.env.GMAIL_USER}>`, to, replyTo:replyTo||process.env.NOTIFY_EMAIL, subject:subj, html }); }
 
 // ════════════════════════════════════════════════════════
