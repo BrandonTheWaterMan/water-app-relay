@@ -89,9 +89,9 @@ const WF = {
 };
 const TRANSITIONS = {
   lead_created:['scan_started'], scan_started:['scan_completed','lead_created'],
-  scan_completed:['proposal_generated'], proposal_generated:['proposal_presented','proposal_accepted','finance_started','contract_signed'],
-  proposal_presented:['proposal_accepted','contract_ready','contract_signed'], proposal_accepted:['finance_started','contract_ready','contract_signed'],
-  finance_started:['finance_completed','proposal_accepted'], finance_completed:['contract_ready','contract_signed'],
+  scan_completed:['proposal_generated'], proposal_generated:['proposal_presented','proposal_accepted','finance_started'],
+  proposal_presented:['proposal_accepted','contract_ready'], proposal_accepted:['finance_started','contract_ready'],
+  finance_started:['finance_completed','proposal_accepted'], finance_completed:['contract_ready'],
   contract_ready:['contract_signed'], contract_signed:['schedule_requested'],
   schedule_requested:['schedule_pending'], schedule_pending:['schedule_confirmed','schedule_requested'],
   schedule_confirmed:['install_ready'], install_ready:['installed'], installed:[]
