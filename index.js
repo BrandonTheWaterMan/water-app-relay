@@ -4,6 +4,7 @@ const cors       = require('cors');
 const nodemailer = require('nodemailer');
 const fetch      = require('node-fetch');
 const admin      = require('firebase-admin');
+const { Client, Environment, ApiError } = require('square');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -22,9 +23,31 @@ try {
   }
 } catch (e) { console.error('[Relay] Firebase init failed:', e.message); }
 
+// ── Square Client ───────────────────────────────────────
+let squareReady = false;
+let squarePayments = null;
+let squareCustomers = null;
+let squareCards = null;
+try {
+  if (process.env.SQUARE_ACCESS_TOKEN) {
+    const squareClient = new Client({
+      accessToken: process.env.SQUARE_ACCESS_TOKEN,
+      environment: Environment.Production
+    });
+    squarePayments  = squareClient.paymentsApi;
+    squareCustomers = squareClient.customersApi;
+    squareCards     = squareClient.cardsApi;
+    squareReady     = true;
+    console.log('[Relay] Square ✅');
+  } else {
+    console.warn('[Relay] No SQUARE_ACCESS_TOKEN — Square disabled');
+  }
+} catch (e) { console.error('[Relay] Square init failed:', e.message); }
+
 // ── CORS ────────────────────────────────────────────────
 const ALLOWED = [
   'https://the-water-app.netlify.app',
+  'https://cfl-twa-admin.netlify.app',
   'https://cflwatertreatment.com',
   'https://www.cflwatertreatment.com',
   'http://localhost:3000',
@@ -75,6 +98,21 @@ async function requireAuth(req, res, next) {
     const d = await admin.auth().verifyIdToken(tok);
     req.uid = d.uid; req.email = d.email || null; next();
   } catch (e) { return res.status(401).json({ error: 'Unauthorized: token invalid' }); }
+}
+
+// ── Admin middleware ────────────────────────────────────
+const ADMIN_EMAILS = [
+  'brandonthewaterman@gmail.com',
+  'admin@cflwatertreatment.com'
+];
+async function requireAdmin(req, res, next) {
+  await requireAuth(req, res, async () => {
+    if (!firebaseReady) return next(); // dev bypass
+    if (!req.email || !ADMIN_EMAILS.includes(req.email.toLowerCase())) {
+      return res.status(403).json({ error: 'Forbidden: admin only' });
+    }
+    next();
+  });
 }
 
 // ── Workflow state machine ──────────────────────────────
@@ -145,20 +183,31 @@ function getTransporter() {
   return nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 587,
-    secure: false, // STARTTLS — Render free tier allows 587, blocks 465
+    secure: false,
     auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASS },
     tls: { rejectUnauthorized: false }
   });
 }
 async function mail(to, subj, html, replyTo) { await getTransporter().sendMail({ from:`"The Water App" <${process.env.GMAIL_USER}>`, to, replyTo:replyTo||process.env.NOTIFY_EMAIL, subject:subj, html }); }
 
+// ── Square amount helper ────────────────────────────────
+// Square works in cents (integers). Prices in our app are dollars.
+function toCents(dollars) {
+  return Math.round(Number(dollars) * 100);
+}
+
 // ════════════════════════════════════════════════════════
 // ENDPOINTS
 // ════════════════════════════════════════════════════════
 
-app.get('/', rateLimit(60,900000), (req,res) => res.json({ status:'Water App Relay v3.0 ✅', firebase:firebaseReady?'active':'dev', stateMachine:'enabled', provenance:'enabled', idempotency:'enabled' }));
+app.get('/', rateLimit(60,900000), (req,res) => res.json({
+  status:'Water App Relay v3.1 ✅',
+  firebase: firebaseReady ? 'active' : 'dev',
+  square:   squareReady   ? 'active' : 'disabled',
+  stateMachine:'enabled', provenance:'enabled', idempotency:'enabled'
+}));
 
-// GET /workflow/:uid — fetch canonical state
+// GET /workflow/:uid
 app.get('/workflow/:uid', rateLimit(30,900000), requireAuth, async (req,res) => {
   if (req.params.uid !== req.uid) return res.status(403).json({ error:'Forbidden' });
   try { const s = await getWFState(req.uid); res.json({ state: s||{ currentState:'lead_created' } }); }
@@ -280,11 +329,200 @@ app.post('/schedule/create', rateLimit(10,900000), requireAuth, async (req,res) 
   res.json(result);
 });
 
+// ── Square: POST /square/save-card (protected, customer-facing) ─
+// Called after customer tokenizes card on payment screen.
+// Creates Square Customer + saves card on file.
+// Stores squareCustomerId + squareCardId in Firestore contracts doc.
+app.post('/square/save-card', rateLimit(5,900000), requireAuth, async (req,res) => {
+  if (!squareReady) return res.status(503).json({ error:'Payment processing unavailable' });
+  const { sourceId, artifactId, customerName, customerEmail, customerPhone, billingAddress } = req.body;
+  if (!sourceId || !artifactId || !customerName || !customerEmail) {
+    return res.status(400).json({ error:'sourceId, artifactId, customerName, customerEmail required' });
+  }
+
+  try {
+    // 1. Create Square Customer
+    const custResp = await squareCustomers.createCustomer({
+      idempotencyKey: `cust_${req.uid}_${Date.now()}`,
+      givenName:  san(customerName.split(' ')[0] || customerName),
+      familyName: san(customerName.split(' ').slice(1).join(' ') || ''),
+      emailAddress: san(customerEmail),
+      phoneNumber:  san(customerPhone || ''),
+      address: billingAddress ? {
+        addressLine1: san(billingAddress.line1 || ''),
+        locality:     san(billingAddress.city  || ''),
+        administrativeDistrictLevel1: san(billingAddress.state || 'FL'),
+        postalCode:   san(billingAddress.zip   || ''),
+        country: 'US'
+      } : undefined,
+      note: `Water App — UID: ${req.uid} | Artifact: ${san(artifactId)}`
+    });
+
+    const squareCustomerId = custResp.result.customer.id;
+
+    // 2. Save card on file against that customer
+    const cardResp = await squareCards.createCard({
+      idempotencyKey: `card_${req.uid}_${Date.now()}`,
+      sourceId: san(sourceId),
+      card: {
+        customerId: squareCustomerId,
+        billingAddress: billingAddress ? {
+          addressLine1: san(billingAddress.line1 || ''),
+          locality:     san(billingAddress.city  || ''),
+          administrativeDistrictLevel1: san(billingAddress.state || 'FL'),
+          postalCode:   san(billingAddress.zip   || ''),
+          country: 'US'
+        } : undefined
+      }
+    });
+
+    const card = cardResp.result.card;
+    const squareCardId  = card.id;
+    const last4         = card.last4;
+    const cardBrand     = card.cardBrand; // VISA, MASTERCARD, etc.
+
+    // 3. Store in Firestore contracts doc (merge so existing sign data survives)
+    if (db) {
+      await db.collection('contracts').doc(san(artifactId)).set({
+        squareCustomerId,
+        squareCardId,
+        cardLast4:  last4,
+        cardBrand,
+        cardSavedAt: admin.firestore.FieldValue.serverTimestamp(),
+        cardSavedBy: req.uid
+      }, { merge: true });
+    }
+
+    console.log(`[square] card saved uid=${req.uid} artifact=${artifactId} last4=${last4} brand=${cardBrand}`);
+    res.json({ success:true, last4, cardBrand });
+
+  } catch (e) {
+    // Square SDK wraps errors in ApiError
+    if (e instanceof ApiError) {
+      const msg = e.errors?.[0]?.detail || 'Card save failed';
+      console.error('[square/save-card] ApiError:', msg);
+      return res.status(400).json({ error: msg });
+    }
+    console.error('[square/save-card]', e.message);
+    res.status(500).json({ error:'Card save failed — please try again' });
+  }
+});
+
+// ── Square: POST /square/charge (admin-only, manual trigger) ────
+// Brandon taps "Charge Deposit" or "Charge Balance" in admin panel.
+// Looks up squareCustomerId + squareCardId from Firestore contracts doc.
+// Fires the charge. Logs result back to Firestore.
+app.post('/square/charge', rateLimit(10,900000), requireAdmin, async (req,res) => {
+  if (!squareReady) return res.status(503).json({ error:'Payment processing unavailable' });
+  const { artifactId, chargeType, amountDollars, note } = req.body;
+  // chargeType: 'deposit' | 'balance'
+  if (!artifactId || !chargeType || !amountDollars) {
+    return res.status(400).json({ error:'artifactId, chargeType, amountDollars required' });
+  }
+  if (!['deposit','balance'].includes(chargeType)) {
+    return res.status(400).json({ error:'chargeType must be deposit or balance' });
+  }
+  const amountCents = toCents(amountDollars);
+  if (amountCents < 100) return res.status(400).json({ error:'Minimum charge is $1.00' });
+
+  try {
+    // Fetch card credentials from Firestore
+    if (!db) return res.status(503).json({ error:'Database unavailable' });
+    const contractDoc = await db.collection('contracts').doc(san(artifactId)).get();
+    if (!contractDoc.exists) return res.status(404).json({ error:'Contract not found' });
+    const contractData = contractDoc.data();
+
+    const { squareCustomerId, squareCardId, cardLast4, cardBrand } = contractData;
+    if (!squareCustomerId || !squareCardId) {
+      return res.status(400).json({ error:'No card on file for this contract. Customer must save card first.' });
+    }
+
+    // Check not already charged for this type
+    if (chargeType === 'deposit' && contractData.depositChargedAt) {
+      return res.status(409).json({ error:'Deposit already charged', chargedAt: contractData.depositChargedAt });
+    }
+    if (chargeType === 'balance' && contractData.balanceChargedAt) {
+      return res.status(409).json({ error:'Balance already charged', chargedAt: contractData.balanceChargedAt });
+    }
+
+    // Fire payment
+    const chargeResp = await squarePayments.createPayment({
+      idempotencyKey: `${chargeType}_${san(artifactId)}_${Date.now()}`,
+      sourceId: squareCardId,
+      customerId: squareCustomerId,
+      amountMoney: {
+        amount: BigInt(amountCents),
+        currency: 'USD'
+      },
+      locationId: process.env.SQUARE_LOCATION_ID,
+      note: san(note || `CFL Water Treatment — ${chargeType === 'deposit' ? 'Deposit' : 'Balance'} | ${san(artifactId)}`)
+    });
+
+    const payment    = chargeResp.result.payment;
+    const paymentId  = payment.id;
+    const payStatus  = payment.status; // COMPLETED, APPROVED, etc.
+    const receiptUrl = payment.receiptUrl || null;
+
+    // Log back to Firestore
+    const updateField = chargeType === 'deposit' ? {
+      depositPaymentId:  paymentId,
+      depositAmountCents: amountCents,
+      depositStatus:     payStatus,
+      depositReceiptUrl: receiptUrl,
+      depositChargedAt:  admin.firestore.FieldValue.serverTimestamp(),
+      depositChargedBy:  req.email
+    } : {
+      balancePaymentId:  paymentId,
+      balanceAmountCents: amountCents,
+      balanceStatus:     payStatus,
+      balanceReceiptUrl: receiptUrl,
+      balanceChargedAt:  admin.firestore.FieldValue.serverTimestamp(),
+      balanceChargedBy:  req.email
+    };
+
+    await db.collection('contracts').doc(san(artifactId)).set(updateField, { merge: true });
+
+    // Notify Brandon by email
+    const customerName = contractData.contractSummary?.customerName || 'Customer';
+    const systemName   = contractData.contractSummary?.systemName   || 'System';
+    try {
+      await mail(
+        process.env.NOTIFY_EMAIL,
+        `💳 ${chargeType === 'deposit' ? 'Deposit' : 'Balance'} Charged — ${san(customerName)} | $${Number(amountDollars).toLocaleString()}`,
+        `<div style="font-family:sans-serif;background:#060D1A;color:#F4F8FF;padding:24px;">
+          <h2 style="color:#00D4F5;">Payment ${payStatus} ✅</h2>
+          <p><b>Type:</b> ${chargeType === 'deposit' ? 'Deposit (50%)' : 'Balance (50%)'}</p>
+          <p><b>Customer:</b> ${san(customerName)}</p>
+          <p><b>System:</b> ${san(systemName)}</p>
+          <p><b>Amount:</b> $${Number(amountDollars).toLocaleString()}</p>
+          <p><b>Card:</b> ${san(cardBrand||'')} ····${san(cardLast4||'')}</p>
+          <p><b>Payment ID:</b> ${paymentId}</p>
+          ${receiptUrl ? `<p><a href="${receiptUrl}" style="color:#00D4F5;">View Receipt →</a></p>` : ''}
+          <p><b>Charged by:</b> ${san(req.email)}</p>
+        </div>`
+      );
+    } catch(e) { console.warn('[square/charge] email:', e.message); }
+
+    console.log(`[square] charge fired uid=${req.uid} artifact=${artifactId} type=${chargeType} amount=${amountCents}c paymentId=${paymentId} status=${payStatus}`);
+    res.json({ success:true, paymentId, status:payStatus, receiptUrl, amountDollars, chargeType });
+
+  } catch (e) {
+    if (e instanceof ApiError) {
+      const msg = e.errors?.[0]?.detail || 'Charge failed';
+      console.error('[square/charge] ApiError:', msg);
+      return res.status(400).json({ error: msg });
+    }
+    console.error('[square/charge]', e.message);
+    res.status(500).json({ error:'Charge failed — check Square dashboard' });
+  }
+});
+
 app.use((req,res) => res.status(404).json({ error:'Not found' }));
 app.use((err,req,res,next) => { console.error('[Relay]',err.message); res.status(500).json({ error:'Internal server error' }); });
 
 app.listen(PORT, () => {
-  console.log(`\nWater App Relay v3.0 — port ${PORT}`);
+  console.log(`\nWater App Relay v3.1 — port ${PORT}`);
   console.log(`Firebase: ${firebaseReady?'ACTIVE ✅':'DEV MODE ⚠️'}`);
+  console.log(`Square:   ${squareReady  ?'ACTIVE ✅':'DISABLED ⚠️'}`);
   console.log(`State machine | Provenance | Idempotency — all ENABLED\n`);
 });
