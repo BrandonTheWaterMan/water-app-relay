@@ -4,7 +4,7 @@ const cors       = require('cors');
 const nodemailer = require('nodemailer');
 const fetch      = require('node-fetch');
 const admin      = require('firebase-admin');
-const { Client, Environment, ApiError } = require('square');
+const { SquareClient, SquareEnvironment, SquareError } = require('square');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -30,13 +30,13 @@ let squareCustomers = null;
 let squareCards = null;
 try {
   if (process.env.SQUARE_ACCESS_TOKEN) {
-    const squareClient = new Client({
-      accessToken: process.env.SQUARE_ACCESS_TOKEN,
-      environment: Environment.Production
+    const squareClient = new SquareClient({
+      token: process.env.SQUARE_ACCESS_TOKEN,
+      environment: SquareEnvironment.Production
     });
-    squarePayments  = squareClient.paymentsApi;
-    squareCustomers = squareClient.customersApi;
-    squareCards     = squareClient.cardsApi;
+    squarePayments  = squareClient.payments;
+    squareCustomers = squareClient.customers;
+    squareCards     = squareClient.cards;
     squareReady     = true;
     console.log('[Relay] Square ✅');
   } else {
@@ -397,10 +397,10 @@ app.post('/square/save-card', rateLimit(5,900000), requireAuth, async (req,res) 
     res.json({ success:true, last4, cardBrand });
 
   } catch (e) {
-    // Square SDK wraps errors in ApiError
-    if (e instanceof ApiError) {
+    // Square SDK wraps errors in SquareError
+    if (e instanceof SquareError) {
       const msg = e.errors?.[0]?.detail || 'Card save failed';
-      console.error('[square/save-card] ApiError:', msg);
+      console.error('[square/save-card] SquareError:', msg);
       return res.status(400).json({ error: msg });
     }
     console.error('[square/save-card]', e.message);
@@ -507,9 +507,9 @@ app.post('/square/charge', rateLimit(10,900000), requireAdmin, async (req,res) =
     res.json({ success:true, paymentId, status:payStatus, receiptUrl, amountDollars, chargeType });
 
   } catch (e) {
-    if (e instanceof ApiError) {
+    if (e instanceof SquareError) {
       const msg = e.errors?.[0]?.detail || 'Charge failed';
-      console.error('[square/charge] ApiError:', msg);
+      console.error('[square/charge] SquareError:', msg);
       return res.status(400).json({ error: msg });
     }
     console.error('[square/charge]', e.message);
