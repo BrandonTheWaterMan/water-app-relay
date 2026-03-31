@@ -89,10 +89,12 @@ const WF = {
 };
 const TRANSITIONS = {
   lead_created:['scan_started'], scan_started:['scan_completed','lead_created'],
-  scan_completed:['proposal_generated'], proposal_generated:['proposal_presented','proposal_accepted','finance_started','contract_signed'],
-  proposal_presented:['proposal_accepted','contract_ready','contract_signed'], proposal_accepted:['finance_started','contract_ready','contract_signed'],
-  finance_started:['finance_completed','proposal_accepted'], finance_completed:['contract_ready','contract_signed'],
-  contract_ready:['contract_signed'], contract_signed:['schedule_requested'],
+  scan_completed:['proposal_generated','scan_started'], proposal_generated:['proposal_presented','proposal_accepted','finance_started','contract_signed','scan_started'],
+  proposal_presented:['proposal_accepted','contract_ready','contract_signed','scan_started'], proposal_accepted:['finance_started','contract_ready','contract_signed','scan_started'],
+  finance_started:['finance_completed','proposal_accepted','scan_started'], finance_completed:['contract_ready','contract_signed','scan_started'],
+  contract_ready:['contract_signed','scan_started'], contract_signed:['schedule_requested','scan_started'],
+  schedule_requested:['schedule_pending','scan_started'], schedule_pending:['schedule_confirmed','schedule_requested','scan_started'],
+  schedule_confirmed:['install_ready','scan_started'], install_ready:['installed','scan_started'],
   schedule_requested:['schedule_pending'], schedule_pending:['schedule_confirmed','schedule_requested'],
   schedule_confirmed:['install_ready'], install_ready:['installed'], installed:[]
 };
@@ -288,11 +290,33 @@ app.post('/generate-proposal', rateLimit(20,900000), requireAuth, async (req,res
 });
 
 // POST /proposal/accept (protected)
+// Allowed from any post-scan state — supports reactivating old quotes
 app.post('/proposal/accept', rateLimit(10,900000), requireAuth, async (req,res) => {
   const { proposalId, systemName, systemPrice } = req.body;
   if (!proposalId||!systemPrice) return res.status(400).json({ error:'proposalId and systemPrice required' });
-  try { const r=await transition(req.uid, WF.PROPOSAL_ACCEPTED, { proposalId:san(proposalId), systemName:san(systemName||''), systemPrice:Number(systemPrice)||0 }); res.json({ success:true, state:r.state }); }
-  catch(e) { res.status(409).json({ error:e.message }); }
+  try {
+    // Force state back to proposal_accepted regardless of current state
+    // so client can reactivate any saved quote from any point in the flow
+    const wf = await getWFState(req.uid);
+    const cs = wf?.currentState;
+    const postScanStates = ['scan_completed','proposal_generated','proposal_presented','proposal_accepted',
+      'finance_started','finance_completed','contract_ready','contract_signed',
+      'schedule_requested','schedule_pending','schedule_confirmed','install_ready','installed'];
+    if (firebaseReady && cs && !postScanStates.includes(cs)) {
+      return res.status(409).json({ error:`Cannot accept proposal from state: ${cs}. Complete a water scan first.` });
+    }
+    // Directly write proposal_accepted to Firestore workflow doc (bypass transition graph)
+    if (db && firebaseReady) {
+      await db.collection('workflows').doc(req.uid).set({
+        currentState: 'proposal_accepted',
+        proposalId: san(proposalId),
+        systemName: san(systemName||''),
+        systemPrice: Number(systemPrice)||0,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+    }
+    res.json({ success:true, state:'proposal_accepted' });
+  } catch(e) { res.status(409).json({ error:e.message }); }
 });
 
 // POST /submit-finance-app (protected, strictest)
@@ -417,6 +441,25 @@ app.post('/square/charge', rateLimit(5,900000), requireAuth, async (req,res) => 
     res.status(500).json({ error:'Payment request failed. Please try again.' });
   }
 });
+
+// POST /reset (protected) — clears workflow state so client can restart from scan
+app.post('/reset', rateLimit(5,900000), requireAuth, async (req,res) => {
+  try {
+    if (db && firebaseReady) {
+      await db.collection('workflows').doc(req.uid).set({
+        currentState: 'lead_created',
+        resetAt: admin.firestore.FieldValue.serverTimestamp(),
+        resetBy: req.uid
+      }, { merge: true });
+    }
+    console.log(`[reset] uid ${req.uid} reset workflow to lead_created`);
+    res.json({ success:true, state:'lead_created' });
+  } catch(e) {
+    console.error('[reset]', e.message);
+    res.status(500).json({ error:'Could not reset workflow state.' });
+  }
+});
+
 
 app.listen(PORT, () => {
   console.log(`\nWater App Relay v3.0 — port ${PORT}`);
