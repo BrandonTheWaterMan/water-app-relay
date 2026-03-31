@@ -4,7 +4,6 @@ const cors       = require('cors');
 const nodemailer = require('nodemailer');
 const fetch      = require('node-fetch');
 const admin      = require('firebase-admin');
-
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
@@ -87,17 +86,27 @@ const WF = {
   SCHEDULE_PENDING:'schedule_pending', SCHEDULE_CONFIRMED:'schedule_confirmed',
   INSTALL_READY:'install_ready', INSTALLED:'installed'
 };
+
+// FIX: No duplicate keys — each state defined exactly once
+// scan_started added as valid target from every state (enables Start Over from anywhere)
 const TRANSITIONS = {
-  lead_created:['scan_started'], scan_started:['scan_completed','lead_created'],
-  scan_completed:['proposal_generated','scan_started'], proposal_generated:['proposal_presented','proposal_accepted','finance_started','contract_signed','scan_started'],
-  proposal_presented:['proposal_accepted','contract_ready','contract_signed','scan_started'], proposal_accepted:['finance_started','contract_ready','contract_signed','scan_started'],
-  finance_started:['finance_completed','proposal_accepted','scan_started'], finance_completed:['contract_ready','contract_signed','scan_started'],
-  contract_ready:['contract_signed','scan_started'], contract_signed:['schedule_requested','scan_started'],
-  schedule_requested:['schedule_pending','scan_started'], schedule_pending:['schedule_confirmed','schedule_requested','scan_started'],
-  schedule_confirmed:['install_ready','scan_started'], install_ready:['installed','scan_started'],
-  schedule_requested:['schedule_pending'], schedule_pending:['schedule_confirmed','schedule_requested'],
-  schedule_confirmed:['install_ready'], install_ready:['installed'], installed:[]
+  lead_created:       ['scan_started'],
+  scan_started:       ['scan_completed','lead_created'],
+  scan_completed:     ['proposal_generated','scan_started'],
+  proposal_generated: ['proposal_presented','proposal_accepted','finance_started','contract_signed','scan_started'],
+  proposal_presented: ['proposal_accepted','contract_ready','contract_signed','scan_started'],
+  proposal_accepted:  ['finance_started','contract_ready','contract_signed','scan_started'],
+  finance_started:    ['finance_completed','proposal_accepted','scan_started'],
+  finance_completed:  ['contract_ready','contract_signed','scan_started'],
+  contract_ready:     ['contract_signed','scan_started'],
+  contract_signed:    ['schedule_requested','scan_started'],
+  schedule_requested: ['schedule_pending','scan_started'],
+  schedule_pending:   ['schedule_confirmed','schedule_requested','scan_started'],
+  schedule_confirmed: ['install_ready','scan_started'],
+  install_ready:      ['installed','scan_started'],
+  installed:          ['scan_started']
 };
+
 async function getWFState(uid) {
   if (!db) return null;
   const s = await db.collection('workflow').doc(uid).get();
@@ -145,22 +154,22 @@ function buildProv(ewg, epa, fetchStart, zip) {
 // ── Email helper ────────────────────────────────────────
 function getTransporter() {
   return nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false, // STARTTLS — Render free tier allows 587, blocks 465
+    host: 'smtp.gmail.com', port: 587, secure: false,
     auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASS },
     tls: { rejectUnauthorized: false }
   });
 }
-async function mail(to, subj, html, replyTo) { await getTransporter().sendMail({ from:`"The Water App" <${process.env.GMAIL_USER}>`, to, replyTo:replyTo||process.env.NOTIFY_EMAIL, subject:subj, html }); }
+async function mail(to, subj, html, replyTo) {
+  await getTransporter().sendMail({ from:`"The Water App" <${process.env.GMAIL_USER}>`, to, replyTo:replyTo||process.env.NOTIFY_EMAIL, subject:subj, html });
+}
 
 // ════════════════════════════════════════════════════════
 // ENDPOINTS
 // ════════════════════════════════════════════════════════
 
-app.get('/', rateLimit(60,900000), (req,res) => res.json({ status:'Water App Relay v3.0 ✅', firebase:firebaseReady?'active':'dev', stateMachine:'enabled', provenance:'enabled', idempotency:'enabled' }));
+app.get('/', rateLimit(60,900000), (req,res) => res.json({ status:'Water App Relay v3.1 ✅', firebase:firebaseReady?'active':'dev', stateMachine:'enabled', provenance:'enabled', idempotency:'enabled', reset:'enabled' }));
 
-// GET /workflow/:uid — fetch canonical state
+// GET /workflow/:uid
 app.get('/workflow/:uid', rateLimit(30,900000), requireAuth, async (req,res) => {
   if (req.params.uid !== req.uid) return res.status(403).json({ error:'Forbidden' });
   try { const s = await getWFState(req.uid); res.json({ state: s||{ currentState:'lead_created' } }); }
@@ -183,86 +192,40 @@ app.post('/water-scan', rateLimit(20,900000), requireAuth, async (req,res) => {
   if (!zip||!/^\d{5}$/.test(String(zip))) return res.status(400).json({ error:'Valid 5-digit zip required' });
   safeLog('water-scan', req.uid, { zip, city, state, waterSource });
   try { await transition(req.uid, WF.SCAN_STARTED, { zip, address:san(address||''), waterSource:san(waterSource||'') }); } catch(e) { console.warn('[scan] state warn:', e.message); }
-  const fs = Date.now(); let ewg=null, epa=null;
-  // EWG blocks server-side API calls — skip and use EPA + regional data
+  const fs = Date.now(); let epa=null;
   try {
     const r = await fetch(`https://data.epa.gov/efservice/WATER_SYSTEM/ZIP_CODE/${zip}/JSON`,
       {headers:{Accept:'application/json'},signal:AbortSignal.timeout(8000)});
     if(r.ok) { const d=await r.json(); epa=Array.isArray(d)?d:null; }
   } catch(e) { console.warn('[scan] EPA:',e.message); }
-
-  // ── Build normalized water data from EPA + regional FL model ──────────────
-  // Find primary active community water system
   const activeSystems = (epa||[]).filter(s => s.pws_activity_code==='A' && ['CWS','NTNCWS'].includes(s.pws_type_code));
   const primarySystem = activeSystems.sort((a,b)=>(b.population_served_count||0)-(a.population_served_count||0))[0] || (epa||[])[0];
   const utilityName   = primarySystem?.pws_name || 'Municipal Water Utility';
   const utilityCity   = primarySystem?.city_name || city || '';
   const waterSrcCode  = primarySystem?.primary_source_code || (waterSource==='well'?'GW':'SW');
   const isGroundwater = waterSrcCode==='GW' || waterSource==='well';
-
-  // Florida regional contaminants by water source (based on FL DEP and EWG historical data)
-  const FL_CITY_CONTAMINANTS = [
-    'Total Trihalomethanes (TTHMs)',
-    'Haloacetic Acids (HAA5)',
-    'Chloroform',
-    'Bromodichloromethane',
-    'Radium-226 and Radium-228',
-    'Total Coliform (historical detections)',
-    'Nitrate',
-    'Fluoride (added)'
-  ];
-  const FL_WELL_CONTAMINANTS = [
-    'Iron',
-    'Hydrogen Sulfide (Sulfur)',
-    'Manganese',
-    'Total Hardness (Calcium/Magnesium)',
-    'Turbidity',
-    'Bacteria (Coliform risk)',
-    'Radon-222',
-    'Tannins'
-  ];
+  const FL_CITY_CONTAMINANTS = ['Total Trihalomethanes (TTHMs)','Haloacetic Acids (HAA5)','Chloroform','Bromodichloromethane','Radium-226 and Radium-228','Total Coliform (historical detections)','Nitrate','Fluoride (added)'];
+  const FL_WELL_CONTAMINANTS = ['Iron','Hydrogen Sulfide (Sulfur)','Manganese','Total Hardness (Calcium/Magnesium)','Turbidity','Bacteria (Coliform risk)','Radon-222','Tannins'];
   const contaminants = isGroundwater ? FL_WELL_CONTAMINANTS : FL_CITY_CONTAMINANTS;
-
-  // Florida water hardness by region (Volusia/Seminole = moderately hard to hard)
-  // 1 gpg = 17.1 mg/L
-  const FL_HARDNESS_REGIONS = {
-    '32720':180,'32721':180,'32722':180,'32724':175,'32725':170,'32726':165,
-    '32730':160,'32732':160,'32751':165,'32763':185,'32764':185,'32765':170,
-    '32771':175,'32773':175,'32792':165,'32801':155,'32803':155,'32804':155,
-    '32805':155,'32806':155,'32807':155,'32808':155,'32809':155,'32810':155,
-    '32811':155,'32812':155,'32813':155,'32814':155,'32815':155,'32816':155,
-    '32817':155,'32818':155,'32819':155,'32820':155,'32821':155,'32822':155,
-    '32824':155,'32825':155,'32826':155,'32827':155,'32828':155,'32829':155,
-    '32830':155,'32831':155,'32832':155,'32833':155,'32835':155,'32836':155,
-  };
-  const hardnessMgL = FL_HARDNESS_REGIONS[zip] || 175; // default Volusia
+  const FL_HARDNESS = {'32720':180,'32721':180,'32722':180,'32724':175,'32725':170,'32726':165,'32730':160,'32732':160,'32751':165,'32763':185,'32764':185,'32765':170,'32771':175,'32773':175,'32792':165,'32801':155,'32803':155,'32804':155,'32805':155,'32806':155,'32807':155,'32808':155,'32809':155,'32810':155,'32811':155,'32812':155,'32813':155,'32814':155,'32815':155,'32816':155,'32817':155,'32818':155,'32819':155,'32820':155,'32821':155,'32822':155,'32824':155,'32825':155,'32826':155,'32827':155,'32828':155,'32829':155,'32830':155,'32831':155,'32832':155,'32833':155,'32835':155,'32836':155};
+  const hardnessMgL = FL_HARDNESS[zip] || 175;
   const hardnessGPG = Math.round(hardnessMgL / 17.1 * 10) / 10;
   const hardnessLabel = hardnessGPG < 3.5 ? 'Soft' : hardnessGPG < 7 ? 'Moderately Hard' : hardnessGPG < 10.5 ? 'Hard' : 'Very Hard';
-
-  // Water quality score: penalize for known FL issues
   let baseScore = isGroundwater ? 52 : 58;
   if (hardnessGPG > 10) baseScore -= 8;
   if (hardnessGPG > 7)  baseScore -= 5;
-  if (!isGroundwater)   baseScore -= 5; // TTHMs always present in FL municipal
+  if (!isGroundwater)   baseScore -= 5;
   const ewgScore = Math.max(20, Math.min(85, baseScore));
-
-  // Normalized ewg-compatible object the app expects
   const normalizedEwg = {
-    contaminants,
-    ewgScore,
-    score:         ewgScore,
-    hardness:      `${hardnessGPG} gpg (${hardnessMgL} mg/L) — ${hardnessLabel}`,
-    hardness_gpg:  hardnessGPG,
-    hardnessMgL,
-    utility:       utilityName,
-    utilities:     activeSystems.slice(0,3).map(s=>({name:s.pws_name,pwsid:s.pwsid,pop:s.population_served_count})),
-    summary:       `${contaminants.length} contaminants detected or historically present in the ${utilityCity||'local'} water supply based on EPA records and Florida regional water quality data.`,
-    dataSource:    epa?.length ? 'EPA SDWIS + FL Regional Model' : 'FL Regional Model',
-    isLiveEpa:     !!(epa?.length),
-    waterSource:   waterSource || 'city',
-    zipCode:       zip
+    contaminants, ewgScore, score:ewgScore,
+    hardness:`${hardnessGPG} gpg (${hardnessMgL} mg/L) — ${hardnessLabel}`,
+    hardness_gpg:hardnessGPG, hardnessMgL,
+    utility:utilityName,
+    utilities:activeSystems.slice(0,3).map(s=>({name:s.pws_name,pwsid:s.pwsid,pop:s.population_served_count})),
+    summary:`${contaminants.length} contaminants detected or historically present in the ${utilityCity||'local'} water supply based on EPA records and Florida regional water quality data.`,
+    dataSource:epa?.length?'EPA SDWIS + FL Regional Model':'FL Regional Model',
+    isLiveEpa:!!(epa?.length), waterSource:waterSource||'city', zipCode:zip
   };
-
   const prov = buildProv(normalizedEwg, epa, fs, zip);
   try { await transition(req.uid, WF.SCAN_COMPLETED, { sourceMode:prov.sourceMode, addressConfidence:prov.addressConfidence, validationStatus:prov.validationStatus, isLiveData:prov.isLiveData, zip }); } catch(e) { console.warn('[scan] scan_completed:',e.message); }
   const result = { success:true, provenance:prov, zip, address:san(address||''), waterSource:san(waterSource||''), ewg:normalizedEwg, epa:epa?.slice(0,5)||null, isLiveData:prov.isLiveData, scannedAt:prov.fetchedAt };
@@ -277,7 +240,7 @@ app.post('/generate-proposal', rateLimit(20,900000), requireAuth, async (req,res
   const { contact, address, waterSource, ownerStatus, existingSystem, ewgData, zipCode } = req.body;
   if (!address||!waterSource) return res.status(400).json({ error:'address and waterSource required' });
   const wf = await getWFState(req.uid);
-  if (firebaseReady&&wf?.currentState&&!['scan_completed','proposal_generated','proposal_presented','proposal_accepted','finance_started','finance_completed','contract_ready','contract_signed','schedule_requested'].includes(wf.currentState)) return res.status(409).json({ error:`Cannot generate proposal from state: ${wf.currentState}` });
+  if (firebaseReady&&wf?.currentState&&!['scan_completed','proposal_generated','proposal_presented','proposal_accepted','finance_started','finance_completed','contract_ready','contract_signed','schedule_requested','schedule_pending','schedule_confirmed','install_ready','installed'].includes(wf.currentState)) return res.status(409).json({ error:`Cannot generate proposal from state: ${wf.currentState}` });
   const safe = { contact:sanObj(contact||{}), address:san(address), waterSource:san(waterSource), ownerStatus:san(ownerStatus||'own'), existingSystem:sanObj(existingSystem||{}), zipCode:san(zipCode||'') };
   safeLog('generate-proposal', req.uid, safe);
   const name = `${safe.contact.firstName||''} ${safe.contact.lastName||''}`.trim()||'Homeowner';
@@ -289,25 +252,19 @@ app.post('/generate-proposal', rateLimit(20,900000), requireAuth, async (req,res
   res.json(result);
 });
 
-// POST /proposal/accept (protected)
-// Allowed from any post-scan state — supports reactivating old quotes
+// POST /proposal/accept (protected) — allows reactivating old quotes from any post-scan state
 app.post('/proposal/accept', rateLimit(10,900000), requireAuth, async (req,res) => {
   const { proposalId, systemName, systemPrice } = req.body;
   if (!proposalId||!systemPrice) return res.status(400).json({ error:'proposalId and systemPrice required' });
   try {
-    // Force state back to proposal_accepted regardless of current state
-    // so client can reactivate any saved quote from any point in the flow
     const wf = await getWFState(req.uid);
     const cs = wf?.currentState;
-    const postScanStates = ['scan_completed','proposal_generated','proposal_presented','proposal_accepted',
-      'finance_started','finance_completed','contract_ready','contract_signed',
-      'schedule_requested','schedule_pending','schedule_confirmed','install_ready','installed'];
+    const postScanStates = ['scan_completed','proposal_generated','proposal_presented','proposal_accepted','finance_started','finance_completed','contract_ready','contract_signed','schedule_requested','schedule_pending','schedule_confirmed','install_ready','installed'];
     if (firebaseReady && cs && !postScanStates.includes(cs)) {
       return res.status(409).json({ error:`Cannot accept proposal from state: ${cs}. Complete a water scan first.` });
     }
-    // Directly write proposal_accepted to Firestore workflow doc (bypass transition graph)
     if (db && firebaseReady) {
-      await db.collection('workflows').doc(req.uid).set({
+      await db.collection('workflow').doc(req.uid).set({
         currentState: 'proposal_accepted',
         proposalId: san(proposalId),
         systemName: san(systemName||''),
@@ -381,18 +338,12 @@ app.post('/schedule/create', rateLimit(10,900000), requireAuth, async (req,res) 
   res.json(result);
 });
 
-app.use((req,res) => res.status(404).json({ error:'Not found' }));
-app.use((err,req,res,next) => { console.error('[Relay]',err.message); res.status(500).json({ error:'Internal server error' }); });
-
 // POST /square/charge (protected)
 app.post('/square/charge', rateLimit(5,900000), requireAuth, async (req,res) => {
   const { sourceId, amountCents, currency, locationId, note, referenceId, buyerEmail } = req.body;
-  if (!sourceId || !amountCents || !locationId) {
-    return res.status(400).json({ error:'sourceId, amountCents, and locationId required' });
-  }
+  if (!sourceId || !amountCents || !locationId) return res.status(400).json({ error:'sourceId, amountCents, and locationId required' });
   const accessToken = process.env.SQUARE_ACCESS_TOKEN;
   if (!accessToken) return res.status(500).json({ error:'Square not configured on server' });
-
   const idempotencyKey = `cfl-${req.uid}-${Date.now()}`;
   const payload = {
     idempotency_key: idempotencyKey,
@@ -403,15 +354,10 @@ app.post('/square/charge', rateLimit(5,900000), requireAuth, async (req,res) => 
     reference_id: san(referenceId || ''),
     buyer_email_address: san(buyerEmail || '')
   };
-
   try {
     const sqRes = await fetch('https://connect.squareup.com/v2/payments', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-        'Square-Version': '2024-01-17'
-      },
+      headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Square-Version': '2024-01-17' },
       body: JSON.stringify(payload)
     });
     const data = await sqRes.json();
@@ -422,8 +368,6 @@ app.post('/square/charge', rateLimit(5,900000), requireAuth, async (req,res) => 
     }
     const paymentId = data.payment?.id;
     console.log(`[square/charge] ✅ charged ${amountCents}¢ for uid ${req.uid} — paymentId ${paymentId}`);
-
-    // Log to Firestore
     if (db) {
       try {
         await db.collection('square_payments').doc(paymentId).set({
@@ -442,11 +386,12 @@ app.post('/square/charge', rateLimit(5,900000), requireAuth, async (req,res) => 
   }
 });
 
-// POST /reset (protected) — clears workflow state so client can restart from scan
+// POST /reset (protected) — resets workflow to lead_created so client can restart
 app.post('/reset', rateLimit(5,900000), requireAuth, async (req,res) => {
   try {
     if (db && firebaseReady) {
-      await db.collection('workflows').doc(req.uid).set({
+      // FIX: use 'workflow' (no s) — matches getWFState collection
+      await db.collection('workflow').doc(req.uid).set({
         currentState: 'lead_created',
         resetAt: admin.firestore.FieldValue.serverTimestamp(),
         resetBy: req.uid
@@ -460,9 +405,12 @@ app.post('/reset', rateLimit(5,900000), requireAuth, async (req,res) => {
   }
 });
 
+// ── Error handlers LAST (after all routes) ──────────────
+app.use((req,res) => res.status(404).json({ error:'Not found' }));
+app.use((err,req,res,next) => { console.error('[Relay]',err.message); res.status(500).json({ error:'Internal server error' }); });
 
 app.listen(PORT, () => {
-  console.log(`\nWater App Relay v3.0 — port ${PORT}`);
+  console.log(`\nWater App Relay v3.1 — port ${PORT}`);
   console.log(`Firebase: ${firebaseReady?'ACTIVE ✅':'DEV MODE ⚠️'}`);
-  console.log(`State machine | Provenance | Idempotency — all ENABLED\n`);
+  console.log(`State machine | Provenance | Idempotency | Reset — all ENABLED\n`);
 });
