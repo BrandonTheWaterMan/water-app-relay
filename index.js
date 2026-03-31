@@ -198,7 +198,7 @@ app.post('/generate-proposal', rateLimit(20,900000), requireAuth, async (req,res
   const { contact, address, waterSource, ownerStatus, existingSystem, ewgData, zipCode } = req.body;
   if (!address||!waterSource) return res.status(400).json({ error:'address and waterSource required' });
   const wf = await getWFState(req.uid);
-  if (firebaseReady&&wf?.currentState&&!['scan_completed','proposal_generated','proposal_presented'].includes(wf.currentState)) return res.status(409).json({ error:`Cannot generate proposal from state: ${wf.currentState}` });
+  if (firebaseReady&&wf?.currentState&&!['scan_completed','proposal_generated','proposal_presented','proposal_accepted','finance_started','finance_completed','contract_ready','contract_signed','schedule_requested'].includes(wf.currentState)) return res.status(409).json({ error:`Cannot generate proposal from state: ${wf.currentState}` });
   const safe = { contact:sanObj(contact||{}), address:san(address), waterSource:san(waterSource), ownerStatus:san(ownerStatus||'own'), existingSystem:sanObj(existingSystem||{}), zipCode:san(zipCode||'') };
   safeLog('generate-proposal', req.uid, safe);
   const name = `${safe.contact.firstName||''} ${safe.contact.lastName||''}`.trim()||'Homeowner';
